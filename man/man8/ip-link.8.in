@@ -1607,10 +1607,13 @@ For a link of type
 the following additional arguments are supported:
 
 .BI "ip link add " DEVICE
-.BI type " sr6 " mode " { " full " | " reduced " } "
+.BI type " sr6 "
+[
 .BI segs " SEG1,SEG2,...,SEGn"
+.RB "[ " mode " { " full " | " reduced " } ]"
 .RB "[ " table " \fITABLE_ID\fP ]"
 .RB "[ " hmac " \fIKEYID\fP ]"
+]
 
 .in +8
 .sp
@@ -1623,26 +1626,39 @@ the SRH carries the whole segment list. With
 the SRH does not repeat the first segment, which is already in the outer
 IPv6 destination address, when the list has more than one segment. With
 a single segment and no HMAC, no SRH is pushed at all. With a single
-segment and an HMAC, the SRH keeps that segment. This argument is
-mandatory when the device is created.
+segment and an HMAC, the SRH keeps that segment. Defaults to
+.BR full .
 .sp
 .BI segs " SEG1,SEG2,...,SEGn"
 - specifies the SRv6 segment list for encapsulation. The segments
-are IPv6 addresses separated by commas. Each L2 frame transmitted
-through the device is encapsulated in an IPv6 header whose destination
+are IPv6 addresses separated by commas, in first-hop to final-destination
+order. Each L2 frame is encapsulated in an IPv6 header whose destination
 address is the first segment. The Segment Routing Header (SRH), when one
 is pushed, is built from the list as described for
 .BR mode .
+The policy is installed as the only remote of the
+.B 00:00:00:00:00:00
+FDB entry, which handles frames without an FDB entry of their own.
+Without
+.BR segs ,
+the device is created with an empty FDB, and its remotes are added with
+.BR "bridge fdb" .
+Frames with no matching FDB entry are dropped, including broadcast and
+multicast frames.
+The netlink request limits this list to about 60 SIDs, depending on the
+other arguments; longer lists are only possible as FDB policies.
 .sp
 .BI table " TABLE_ID"
 - specifies the FIB table used for routing the outer IPv6+SRH packet
 toward the first SID. When set, fib rules are bypassed and the lookup
 is performed directly in the given table. When omitted, the route is
 resolved through the VRF context inherited from the device hierarchy.
+A table of 0 is the same as no table.
 .sp
 .BI hmac " KEYID"
 - adds an HMAC TLV to the SRH and marks it with the HMAC flag, using
-the given key ID. The HMAC keys are configured separately with
+the given key ID.
+The HMAC keys are configured separately with
 .BR "ip sr hmac" .
 When omitted, no HMAC TLV is added.
 
@@ -1676,9 +1692,16 @@ is given again.
 and
 .B table
 are not part of the SRH. They keep their value when the command leaves
-them out. A
-.I TABLE_ID
-different from the one configured is refused.
+them out, and
+.B table 0
+returns to the inherited routing context.
+.sp
+The command creates the only remote of the
+.B 00:00:00:00:00:00
+FDB entry or replaces it. When that entry holds several remotes, the
+command is refused, and
+.B bridge fdb replace
+has to be used instead.
 .sp
 .B mode
 can be changed without recreating the device. Since
@@ -1696,8 +1719,8 @@ all change. An
 .B mtu
 given in the same command is used instead, so a command that leaves
 .B mtu
-out replaces an MTU set earlier with the default for the new
-configuration. An MTU that is not the default has to be given again on
+out replaces an MTU set earlier with the default for the largest
+overhead among the new policy and the other remotes in the FDB. An MTU that is not the default has to be given again on
 every change.
 
 .in -8

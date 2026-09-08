@@ -29,6 +29,7 @@
 #include "br_common.h"
 #include "rt_names.h"
 #include "utils.h"
+#include "sr6.h"
 
 static unsigned int filter_index, filter_dynamic, filter_master,
 	filter_state, filter_vlan;
@@ -42,6 +43,9 @@ static void usage(void)
 		"              { [ dst IPADDR ] [ port PORT] [ vni VNI ] | [ nhid NHID ] }\n"
 		"	       [ via DEV ] [ src_vni VNI ] [ activity_notify ]\n"
 		"	       [ inactive ] [ norefresh ]\n"
+		"              [ segs SEG1,SEG2,...,SEGn [ mode { full | reduced } ]\n"
+		"                [ table TABLE_ID ] [ old segs SEG1,...,SEGn ]\n"
+		"                [ old table TABLE_ID ] ]\n"
 		"       bridge fdb [ show [ br BRDEV ] [ brport DEV ] [ vlan VID ]\n"
 		"              [ state STATE ] [ dynamic ] ]\n"
 		"       bridge fdb get [ to ] LLADDR [ br BRDEV ] { brport | dev } DEV\n"
@@ -161,6 +165,24 @@ static void fdb_print_ext_attrs(struct rtattr *nfea)
 	}
 }
 
+static void fdb_print_sr6(struct rtattr *attr)
+{
+	struct rtattr *tb[NDA_SR6_MAX + 1];
+
+	parse_rtattr_nested(tb, NDA_SR6_MAX, attr);
+
+	if (!tb[NDA_SR6_SRH] || !sr6_print_srh(tb[NDA_SR6_SRH]))
+		return;
+
+	if (tb[NDA_SR6_MODE])
+		print_string(PRINT_ANY, "mode", "mode %s ",
+			     sr6_mode_n2a(rta_getattr_u8(tb[NDA_SR6_MODE])));
+
+	if (tb[NDA_SR6_TABLE])
+		print_uint(PRINT_ANY, "table", "table %u ",
+			   rta_getattr_u32(tb[NDA_SR6_TABLE]));
+}
+
 int print_fdb(struct nlmsghdr *n, void *arg)
 {
 	FILE *fp = arg;
@@ -251,6 +273,9 @@ int print_fdb(struct nlmsghdr *n, void *arg)
 				   ifa_family_color(family),
 				   "dst", "%s ", dst);
 	}
+
+	if (tb[NDA_SR6])
+		fdb_print_sr6(tb[NDA_SR6]);
 
 	if (vid)
 		print_uint(PRINT_ANY,
@@ -448,12 +473,58 @@ static void fdb_add_ext_attrs(struct nlmsghdr *n, int maxlen,
 	addattr_nest_end(n, nest);
 }
 
+static int fdb_add_sr6_srh(struct nlmsghdr *n, int maxlen, const char *segs)
+{
+	struct ipv6_sr_hdr *srh;
+	int ret;
+
+	srh = sr6_parse_srh(segs, 0);
+	if (!srh) {
+		fprintf(stderr, "sr6: failed to parse segment list\n");
+		return -1;
+	}
+	ret = addattr_l(n, maxlen, NDA_SR6_SRH, srh, (srh->hdrlen + 1) << 3);
+	free(srh);
+	return ret;
+}
+
+/* The kernel identifies a remote by its SRH and table, so a table selects
+ * a remote as much as the segment list does.
+ */
+static int fdb_add_sr6(struct nlmsghdr *n, int maxlen, const char *segs,
+		       int mode, const __u32 *table, const char *old_segs,
+		       const __u32 *old_table)
+{
+	struct rtattr *nest, *old;
+
+	nest = addattr_nest(n, maxlen, NDA_SR6 | NLA_F_NESTED);
+	if (fdb_add_sr6_srh(n, maxlen, segs))
+		return -1;
+	if (mode >= 0 && addattr8(n, maxlen, NDA_SR6_MODE, mode))
+		return -1;
+	if (table && addattr32(n, maxlen, NDA_SR6_TABLE, *table))
+		return -1;
+
+	if (old_segs) {
+		old = addattr_nest(n, maxlen, NDA_SR6_OLD_REMOTE | NLA_F_NESTED);
+		if (fdb_add_sr6_srh(n, maxlen, old_segs))
+			return -1;
+		if (old_table &&
+		    addattr32(n, maxlen, NDA_SR6_TABLE, *old_table))
+			return -1;
+		addattr_nest_end(n, old);
+	}
+
+	addattr_nest_end(n, nest);
+	return 0;
+}
+
 static int fdb_modify(int cmd, int flags, int argc, char **argv)
 {
 	struct {
 		struct nlmsghdr	n;
 		struct ndmsg		ndm;
-		char			buf[256];
+		char			buf[4096];
 	} req = {
 		.n.nlmsg_len = NLMSG_LENGTH(sizeof(struct ndmsg)),
 		.n.nlmsg_flags = NLM_F_REQUEST | flags,
@@ -464,6 +535,10 @@ static int fdb_modify(int cmd, int flags, int argc, char **argv)
 	bool activity_notify = false;
 	bool norefresh = false;
 	bool inactive = false;
+	const char *segs = NULL, *old_segs = NULL;
+	__u32 sr6_table, old_table;
+	bool sr6_table_ok = false, old_table_ok = false;
+	int sr6_mode = -1;
 	char *addr = NULL;
 	char *d = NULL;
 	char abuf[ETH_ALEN];
@@ -487,6 +562,42 @@ static int fdb_modify(int cmd, int flags, int argc, char **argv)
 				duparg2("dst", *argv);
 			get_addr(&dst, *argv, preferred_family);
 			dst_ok = 1;
+		} else if (strcmp(*argv, "segs") == 0) {
+			NEXT_ARG();
+			if (segs)
+				duparg2("segs", *argv);
+			segs = *argv;
+		} else if (strcmp(*argv, "mode") == 0) {
+			NEXT_ARG();
+			if (sr6_mode >= 0)
+				duparg2("mode", *argv);
+			sr6_mode = sr6_mode_a2n(*argv);
+			if (sr6_mode < 0)
+				invarg("invalid sr6 mode", *argv);
+		} else if (strcmp(*argv, "table") == 0) {
+			NEXT_ARG();
+			if (sr6_table_ok)
+				duparg2("table", *argv);
+			if (rtnl_rttable_a2n(&sr6_table, *argv))
+				invarg("invalid table ID", *argv);
+			sr6_table_ok = true;
+		} else if (strcmp(*argv, "old") == 0) {
+			NEXT_ARG();
+			if (strcmp(*argv, "segs") == 0) {
+				NEXT_ARG();
+				if (old_segs)
+					duparg2("old segs", *argv);
+				old_segs = *argv;
+			} else if (strcmp(*argv, "table") == 0) {
+				NEXT_ARG();
+				if (old_table_ok)
+					duparg2("old table", *argv);
+				if (rtnl_rttable_a2n(&old_table, *argv))
+					invarg("invalid table ID", *argv);
+				old_table_ok = true;
+			} else {
+				invarg("expected \"segs\" or \"table\"", *argv);
+			}
 		} else if (strcmp(*argv, "nhid") == 0) {
 			NEXT_ARG();
 			if (get_u32(&nhid, *argv, 0))
@@ -574,6 +685,32 @@ static int fdb_modify(int cmd, int flags, int argc, char **argv)
 	if (nhid && (dst_ok || port || vni != ~0)) {
 		fprintf(stderr, "dst, port, vni are mutually exclusive with nhid\n");
 		return -1;
+	}
+
+	if (!segs && (sr6_mode >= 0 || sr6_table_ok)) {
+		fprintf(stderr, "mode and table require segs\n");
+		return -1;
+	}
+	if ((old_segs || old_table_ok) && (!segs || !old_segs)) {
+		fprintf(stderr, "old table requires old segs, and both require segs\n");
+		return -1;
+	}
+	if (old_segs && !(cmd == RTM_NEWNEIGH && flags & NLM_F_REPLACE)) {
+		fprintf(stderr, "old segs is only supported by replace\n");
+		return -1;
+	}
+
+	if (segs) {
+		if (req.ndm.ndm_flags & ~NTF_SELF ||
+		    dst_ok || nhid || port || vni != ~0 || src_vni != ~0 ||
+		    via || vid >= 0 || activity_notify || inactive || norefresh) {
+			fprintf(stderr, "segs requires a self FDB entry without remote or VLAN attributes\n");
+			return -1;
+		}
+		if (fdb_add_sr6(&req.n, sizeof(req), segs, sr6_mode,
+				sr6_table_ok ? &sr6_table : NULL, old_segs,
+				old_table_ok ? &old_table : NULL))
+			return -1;
 	}
 
 	/* Assume self */

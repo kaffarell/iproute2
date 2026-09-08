@@ -93,6 +93,16 @@ bridge \- show / manipulate bridge addresses and devices
 .IR DEVICE " ] | "
 .B nhid
 .IR NHID " } [ "
+.B segs
+.IR SEG1,SEG2,...,SEGn " [ "
+.B mode
+.RB "{ " full " | " reduced " } ] [ "
+.B table
+.IR TABLE_ID " ] [ "
+.B old segs
+.IR SEG1,SEG2,...,SEGn " [ "
+.B old table
+.IR TABLE_ID " ] ] ] [ "
 .BR activity_notify " ] [ " inactive " ] [ " norefresh " ]
 
 .ti -8
@@ -891,6 +901,80 @@ avoid resetting an FDB entry's activity (i.e., its last updated time). This can
 be useful, for example, when one wants to enable activity notifications on an
 existing entry without modifying its last updated time.
 
+.PP
+For an
+.B sr6
+device, the following arguments are supported:
+
+.TP
+.BI segs " SEG1,SEG2,...,SEGn"
+The SRv6 policy of a remote PE, as a comma-separated list of IPv6 SIDs in
+first-hop to final-destination order. Required for add, append and
+replace; optional for delete. The list may contain 1 to 127 SIDs and
+creates an SRH without TLVs.
+
+.TP
+.BR mode " { " full " | " reduced " }"
+The encapsulation mode of this remote, as described for the
+.B sr6
+link type in
+.BR ip-link (8).
+Defaults to
+.BR full .
+
+.TP
+.BI table " TABLE_ID"
+The FIB table used to route the encapsulated packet toward the first SID.
+Omitted or 0 means the routing context inherited from the device.
+
+.TP
+.BI "old segs" " SEG1,SEG2,...,SEGn"
+.TQ
+.BI "old table" " TABLE_ID"
+With replace, select the remote of the all-zeros entry to replace.
+
+.PP
+The entry
+.B 00:00:00:00:00:00
+is used for broadcast, multicast and unknown unicast frames, and for
+unicast frames without an entry of their own. It can hold several remotes,
+added with
+.BR append ,
+and every frame it handles is sent to each of them. Other entries must have
+a unicast MAC address and hold a single remote. Without a matching entry,
+frames are dropped. The segment list configured with
+.B ip link
+is the only remote of the all-zeros entry.
+
+.PP
+A remote is identified by its segment list and its table; the mode is not
+part of the identity. Mode and table are not kept on replace: an omitted
+mode becomes
+.B full
+and an omitted table the inherited context. Entries use
+.B self
+(the default) and the permanent (the default) or
+.B static
+state. They never learn or age. VLAN keys, remote attributes such as
+.BR dst ,
+learning flags and activity notifications are unsupported. Installing a
+longer policy may require lowering the device MTU first.
+
+.PP
+For example:
+.EX
+ip link add sr6-0 type sr6
+bridge fdb add 00:00:00:00:00:00 dev sr6-0 self permanent segs fc00:2::d20
+bridge fdb append 00:00:00:00:00:00 dev sr6-0 self permanent \\
+	segs fc00:3::d20 mode reduced
+bridge fdb add 02:00:00:00:00:02 dev sr6-0 self permanent \\
+	segs fc00:2::d20 table 200
+bridge fdb replace 00:00:00:00:00:00 dev sr6-0 segs fc00:4::d20 \\
+	old segs fc00:3::d20
+bridge fdb del 00:00:00:00:00:00 dev sr6-0 segs fc00:2::d20
+bridge fdb show dev sr6-0
+.EE
+
 .SS bridge fdb append - append a forwarding database entry
 This command adds a new fdb entry with an already known
 .IR LLADDR .
@@ -900,6 +984,9 @@ Ethernet MAC addresses.
 The Ethernet MAC address is added multiple times into
 the forwarding database and the vxlan device driver
 sends a copy of the data packet to each entry found.
+For sr6, append adds a remote to the
+.B 00:00:00:00:00:00
+entry, creating the entry if needed.
 
 .PP
 The arguments are the same as with
@@ -909,11 +996,24 @@ The arguments are the same as with
 This command removes an existing fdb entry.
 
 .PP
+For sr6, specifying
+.B segs
+removes only the remote with that exact SRH, and
+.B table
+must then match the table of the remote. Without
+.BR segs ,
+the whole entry is removed, including policies containing TLVs installed by
+another application.
+
+.PP
 The arguments are the same as with
 .BR "bridge fdb add" .
 
 .SS bridge fdb replace - replace a forwarding database entry
 If no matching entry is found, a new one will be created instead.
+For sr6, an entry with several remotes requires
+.B old segs
+to select the remote to replace.
 
 .PP
 The arguments are the same as with
