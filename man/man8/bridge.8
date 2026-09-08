@@ -93,6 +93,8 @@ bridge \- show / manipulate bridge addresses and devices
 .IR DEVICE " ] | "
 .B nhid
 .IR NHID " } [ "
+.B segs
+.IR SEG1,SEG2,...,SEGn " ] [ "
 .BR activity_notify " ] [ " inactive " ] [ " norefresh " ]
 
 .ti -8
@@ -891,6 +893,45 @@ avoid resetting an FDB entry's activity (i.e., its last updated time). This can
 be useful, for example, when one wants to enable activity notifications on an
 existing entry without modifying its last updated time.
 
+.PP
+For an
+.B sr6
+device, the following argument is supported:
+
+.TP
+.BI segs " SEG1,SEG2,...,SEGn"
+The SRv6 policy for this destination MAC, as a comma-separated list of IPv6
+SIDs in first-hop to final-destination order. Required for add and replace;
+optional for delete. The list may contain 1 to 127 SIDs and creates an SRH
+without TLVs.
+
+.PP
+An sr6 entry must have a nonzero unicast MAC address and use
+.B self
+(the default for add, replace and delete). Both the default permanent state
+and
+.B static
+are supported. Entries never learn or age, including entries installed with
+.BR dynamic .
+VLAN keys, remote attributes such as
+.BR dst ,
+learning flags, activity notifications, and append are unsupported.
+Each MAC has one policy, which overrides the interface-level segment list.
+All policies use the device's encapsulation mode and routing context.
+An FDB miss uses the interface policy, or drops the frame if none is configured.
+Installing a longer policy may require lowering the device MTU first.
+
+.PP
+For example:
+.EX
+ip link add sr6-0 type sr6 mode full
+bridge fdb add 02:00:00:00:00:01 dev sr6-0 self static segs fc00::a,fc00::b
+bridge fdb replace 02:00:00:00:00:01 dev sr6-0 self static segs fc00::c
+bridge fdb get 02:00:00:00:00:01 dev sr6-0 self
+bridge fdb show dev sr6-0
+bridge fdb del 02:00:00:00:00:01 dev sr6-0 self
+.EE
+
 .SS bridge fdb append - append a forwarding database entry
 This command adds a new fdb entry with an already known
 .IR LLADDR .
@@ -907,6 +948,12 @@ The arguments are the same as with
 
 .SS bridge fdb delete - delete a forwarding database entry
 This command removes an existing fdb entry.
+
+.PP
+For sr6, specifying
+.B segs
+requires an exact match of the installed SRH. Omit it to delete by MAC alone,
+including policies containing TLVs installed by another application.
 
 .PP
 The arguments are the same as with

@@ -39,6 +39,16 @@
                 "description" : "permanent, static, stale, state=#x",
                 "type": "string"
             },
+            "segs": {
+                "description": "sr6 SRv6 SIDs in first-hop to final-destination order",
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 127,
+                "items": {
+                    "type": "string",
+                    "format": "ipv6"
+                }
+            },
             "updated": {
                 "type": "integer"
             },

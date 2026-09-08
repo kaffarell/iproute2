@@ -29,6 +29,7 @@
 #include "br_common.h"
 #include "rt_names.h"
 #include "utils.h"
+#include "sr6.h"
 
 static unsigned int filter_index, filter_dynamic, filter_master,
 	filter_state, filter_vlan;
@@ -42,6 +43,7 @@ static void usage(void)
 		"              { [ dst IPADDR ] [ port PORT] [ vni VNI ] | [ nhid NHID ] }\n"
 		"	       [ via DEV ] [ src_vni VNI ] [ activity_notify ]\n"
 		"	       [ inactive ] [ norefresh ]\n"
+		"              [ segs SEG1,SEG2,...,SEGn ]\n"
 		"       bridge fdb [ show [ br BRDEV ] [ brport DEV ] [ vlan VID ]\n"
 		"              [ state STATE ] [ dynamic ] ]\n"
 		"       bridge fdb get [ to ] LLADDR [ br BRDEV ] { brport | dev } DEV\n"
@@ -252,6 +254,9 @@ int print_fdb(struct nlmsghdr *n, void *arg)
 				   "dst", "%s ", dst);
 	}
 
+	if (tb[NDA_SR6_SRH])
+		sr6_print_srh(tb[NDA_SR6_SRH]);
+
 	if (vid)
 		print_uint(PRINT_ANY,
 				 "vlan", "vlan %hu ", vid);
@@ -453,7 +458,7 @@ static int fdb_modify(int cmd, int flags, int argc, char **argv)
 	struct {
 		struct nlmsghdr	n;
 		struct ndmsg		ndm;
-		char			buf[256];
+		char			buf[4096];
 	} req = {
 		.n.nlmsg_len = NLMSG_LENGTH(sizeof(struct ndmsg)),
 		.n.nlmsg_flags = NLM_F_REQUEST | flags,
@@ -464,6 +469,7 @@ static int fdb_modify(int cmd, int flags, int argc, char **argv)
 	bool activity_notify = false;
 	bool norefresh = false;
 	bool inactive = false;
+	const char *segs = NULL;
 	char *addr = NULL;
 	char *d = NULL;
 	char abuf[ETH_ALEN];
@@ -487,6 +493,11 @@ static int fdb_modify(int cmd, int flags, int argc, char **argv)
 				duparg2("dst", *argv);
 			get_addr(&dst, *argv, preferred_family);
 			dst_ok = 1;
+		} else if (strcmp(*argv, "segs") == 0) {
+			NEXT_ARG();
+			if (segs)
+				duparg2("segs", *argv);
+			segs = *argv;
 		} else if (strcmp(*argv, "nhid") == 0) {
 			NEXT_ARG();
 			if (get_u32(&nhid, *argv, 0))
@@ -574,6 +585,29 @@ static int fdb_modify(int cmd, int flags, int argc, char **argv)
 	if (nhid && (dst_ok || port || vni != ~0)) {
 		fprintf(stderr, "dst, port, vni are mutually exclusive with nhid\n");
 		return -1;
+	}
+
+	if (segs) {
+		struct ipv6_sr_hdr *srh;
+		int ret;
+
+		if (flags & NLM_F_APPEND ||
+		    req.ndm.ndm_flags & ~NTF_SELF ||
+		    dst_ok || nhid || port || vni != ~0 || src_vni != ~0 ||
+		    via || vid >= 0 || activity_notify || inactive || norefresh) {
+			fprintf(stderr, "segs requires a self FDB entry without remote or VLAN attributes\n");
+			return -1;
+		}
+		srh = sr6_parse_srh(segs, 0);
+		if (!srh) {
+			fprintf(stderr, "sr6: failed to parse segment list\n");
+			return -1;
+		}
+		ret = addattr_l(&req.n, sizeof(req), NDA_SR6_SRH, srh,
+				(srh->hdrlen + 1) << 3);
+		free(srh);
+		if (ret < 0)
+			return ret;
 	}
 
 	/* Assume self */
