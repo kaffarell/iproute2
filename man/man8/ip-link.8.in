@@ -1608,9 +1608,11 @@ the following additional arguments are supported:
 
 .BI "ip link add " DEVICE
 .BI type " sr6 " mode " { " full " | " reduced " } "
+[
 .BI segs " SEG1,SEG2,...,SEGn"
-.RB "[ " table " \fITABLE_ID\fP ]"
 .RB "[ " hmac " \fIKEYID\fP ]"
+]
+.RB "[ " table " \fITABLE_ID\fP ]"
 
 .in +8
 .sp
@@ -1627,22 +1629,31 @@ segment and an HMAC, the SRH keeps that segment. This argument is
 mandatory when the device is created.
 .sp
 .BI segs " SEG1,SEG2,...,SEGn"
-- specifies the SRv6 segment list for encapsulation. The segments
-are IPv6 addresses separated by commas. Each L2 frame transmitted
-through the device is encapsulated in an IPv6 header whose destination
+- specifies the default SRv6 segment list for encapsulation. The segments
+are IPv6 addresses separated by commas, in first-hop to final-destination
+order. Each L2 frame is encapsulated in an IPv6 header whose destination
 address is the first segment. The Segment Routing Header (SRH), when one
 is pushed, is built from the list as described for
 .BR mode .
+A matching destination MAC policy installed with
+.B bridge fdb
+overrides this default. Without a default policy, frames with no matching
+FDB entry are dropped, including broadcast and multicast frames.
+The netlink request limits this list to about 60 SIDs, depending on the
+other arguments; longer lists are only possible as FDB policies.
 .sp
 .BI table " TABLE_ID"
 - specifies the FIB table used for routing the outer IPv6+SRH packet
 toward the first SID. When set, fib rules are bypassed and the lookup
 is performed directly in the given table. When omitted, the route is
 resolved through the VRF context inherited from the device hierarchy.
+The routing context and encapsulation mode also apply to FDB policies.
 .sp
 .BI hmac " KEYID"
-- adds an HMAC TLV to the SRH and marks it with the HMAC flag, using
-the given key ID. The HMAC keys are configured separately with
+- adds an HMAC TLV to the default SRH and marks it with the HMAC flag, using
+the given key ID. Requires
+.BR segs .
+The HMAC keys are configured separately with
 .BR "ip sr hmac" .
 When omitted, no HMAC TLV is added.
 

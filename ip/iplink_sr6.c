@@ -6,6 +6,7 @@
  *    ip link add sr6-0 type sr6 mode full segs fc00::a,fc00::b
  *    ip link add sr6-0 type sr6 mode reduced segs fc00::a,fc00::b
  *    ip link add sr6-0 type sr6 mode full segs fc00::a,fc00::b hmac 1
+ *    ip link add sr6-0 type sr6 mode full
  *    ip link set sr6-0 up
  *    ip link set sr6-0 master br0
  */
@@ -22,11 +23,15 @@
 #include "ip_common.h"
 #include "json_print.h"
 #include "rt_names.h"
+#include "sr6.h"
+
+/* parse_opt() appends to the request of iplink_parse(). */
+#define SR6_REQ_MAXLEN	sizeof(struct iplink_req)
 
 static void print_explain(FILE *f)
 {
 	fprintf(f,
-		"Usage: ... sr6 [ mode MODE ] segs SEG1,SEG2,...,SEGn [ table TABLE_ID ] [ hmac KEYID ]\n"
+		"Usage: ... sr6 [ mode MODE ] [ segs SEG1,SEG2,...,SEGn [ hmac KEYID ] ] [ table TABLE_ID ]\n"
 		"\n"
 		"Where:	MODE := { full | reduced }, required when the device is created\n"
 		"	SEGi := IPv6 address (SRv6 SID)\n"
@@ -65,81 +70,19 @@ static int read_sr6_encap_mode(const char *mode)
 	return -1;
 }
 
-/* Build an SRH from a comma-separated list of segments.
- * The segment list is stored in reverse order in the SRH:
- *   segments[0] = last SID (final destination)
- *   segments[first_segment] = first SID (first hop)
- *
- * For a sr6 device, the SRH is used as an encap template.
- * The first SID becomes the outer IPv6 DA after encapsulation.
- *
- * Returns a calloc'd SRH, or NULL if the allocation fails.  Caller must free.
- */
-static struct ipv6_sr_hdr *sr6_parse_srh(char *segbuf, __u32 hmac)
-{
-	struct ipv6_sr_hdr *srh;
-	int nsegs = 0;
-	int srhlen;
-	char *s;
-	int i;
-
-	if (!segbuf || !*segbuf)
-		invarg("missing segment list", "segs");
-
-	s = segbuf;
-	for (i = 0; *s; *s++ == ',' ? i++ : *s);
-	nsegs = i + 1;
-
-	srhlen = 8 + 16 * nsegs;
-
-	if (hmac)
-		srhlen += 40;
-
-	srh = calloc(1, srhlen);
-	if (!srh)
-		return NULL;
-
-	srh->hdrlen = (srhlen >> 3) - 1;
-	srh->type = 4;
-	srh->segments_left = nsegs - 1;
-	srh->first_segment = nsegs - 1;
-
-	if (hmac)
-		srh->flags |= SR6_FLAG1_HMAC;
-
-	i = srh->first_segment;
-	for (s = strtok(segbuf, ","); s; s = strtok(NULL, ",")) {
-		inet_prefix addr;
-
-		get_addr(&addr, s, AF_INET6);
-		memcpy(&srh->segments[i], addr.data, sizeof(struct in6_addr));
-		i--;
-	}
-
-	if (hmac) {
-		struct sr6_tlv_hmac *tlv;
-
-		tlv = (struct sr6_tlv_hmac *)((char *)srh + srhlen - 40);
-		tlv->tlvhdr.type = SR6_TLV_HMAC;
-		tlv->tlvhdr.len = 38;
-		tlv->hmackeyid = htonl(hmac);
-	}
-
-	return srh;
-}
-
 static int sr6_parse_opt(struct link_util *lu, int argc, char **argv,
 			    struct nlmsghdr *n)
 {
 	bool set_op = (n->nlmsg_type == RTM_NEWLINK &&
 		       !(n->nlmsg_flags & NLM_F_CREATE));
-	struct ipv6_sr_hdr *srh = NULL;
-	char segbuf[1024] = {};
+	struct ipv6_sr_hdr *srh;
+	const char *segs = NULL;
 	int table_ok = 0;
 	int mode_ok = 0;
-	int segs_ok = 0;
 	int hmac_ok = 0;
 	__u32 hmac = 0;
+	int srhlen;
+	int ret;
 
 	while (argc > 0) {
 		if (strcmp(*argv, "mode") == 0) {
@@ -151,14 +94,12 @@ static int sr6_parse_opt(struct link_util *lu, int argc, char **argv,
 			mode = read_sr6_encap_mode(*argv);
 			if (mode < 0)
 				invarg("invalid encap mode", *argv);
-			addattr8(n, 1024, IFLA_SR6_ENCAP_MODE, mode);
+			addattr8(n, SR6_REQ_MAXLEN, IFLA_SR6_ENCAP_MODE, mode);
 		} else if (strcmp(*argv, "segs") == 0) {
 			NEXT_ARG();
-			if (segs_ok++)
+			if (segs)
 				duparg2("segs", *argv);
-			if (strlen(*argv) >= sizeof(segbuf))
-				invarg("segment list too long", "segs");
-			strlcpy(segbuf, *argv, sizeof(segbuf));
+			segs = *argv;
 		} else if (strcmp(*argv, "table") == 0) {
 			__u32 table;
 
@@ -167,7 +108,7 @@ static int sr6_parse_opt(struct link_util *lu, int argc, char **argv,
 				duparg2("table", *argv);
 			if (rtnl_rttable_a2n(&table, *argv))
 				invarg("invalid table ID", *argv);
-			addattr32(n, 1024, IFLA_SR6_FIB_TABLE, table);
+			addattr32(n, SR6_REQ_MAXLEN, IFLA_SR6_FIB_TABLE, table);
 		} else if (strcmp(*argv, "hmac") == 0) {
 			NEXT_ARG();
 			if (hmac_ok++)
@@ -195,70 +136,59 @@ static int sr6_parse_opt(struct link_util *lu, int argc, char **argv,
 		return -1;
 	}
 
-	if (!segs_ok) {
-		fprintf(stderr, "sr6: missing \"segs\" argument\n");
-		explain();
-		return -1;
+	if (!segs) {
+		if (hmac_ok) {
+			fprintf(stderr, "sr6: \"hmac\" requires \"segs\"\n");
+			return -1;
+		}
+		return 0;
 	}
 
-	srh = sr6_parse_srh(segbuf, hmac);
+	srh = sr6_parse_srh(segs, hmac);
 	if (!srh) {
 		fprintf(stderr, "sr6: cannot allocate the SRH\n");
 		return -1;
 	}
 
-	addattr_l(n, 1024, IFLA_SR6_SRH, srh,
-		  (srh->hdrlen + 1) << 3);
+	srhlen = (srh->hdrlen + 1) << 3;
+	/* The ip link request buffer is smaller than the largest SRH
+	 * sr6_parse_srh() can build, which bridge fdb is able to send.
+	 */
+	if (NLMSG_ALIGN(n->nlmsg_len) + RTA_ALIGN(RTA_LENGTH(srhlen)) >
+	    SR6_REQ_MAXLEN) {
+		free(srh);
+		invarg("segment list too long for the ip link request", "segs");
+	}
+
+	ret = addattr_l(n, SR6_REQ_MAXLEN, IFLA_SR6_SRH, srh, srhlen);
 
 	free(srh);
-	return 0;
+	return ret;
 }
 
 static void sr6_print_opt(struct link_util *lu, FILE *f,
 			     struct rtattr *tb[])
 {
-	struct ipv6_sr_hdr *srh;
-	int i;
-
 	if (!tb)
 		return;
-
-	if (!tb[IFLA_SR6_SRH])
-		return;
-
-	srh = RTA_DATA(tb[IFLA_SR6_SRH]);
 
 	if (tb[IFLA_SR6_ENCAP_MODE])
 		print_string(PRINT_ANY, "mode", "mode %s ",
 			     format_sr6_encap_mode(
 				rta_getattr_u8(tb[IFLA_SR6_ENCAP_MODE])));
 
-	if (is_json_context())
-		open_json_array(PRINT_JSON, "segs");
-	else
-		print_string(PRINT_FP, NULL, "segs %s", "");
+	if (tb[IFLA_SR6_SRH] && sr6_print_srh(tb[IFLA_SR6_SRH])) {
+		struct ipv6_sr_hdr *srh = RTA_DATA(tb[IFLA_SR6_SRH]);
 
-	for (i = srh->first_segment; i >= 0; i--) {
-		if (!is_json_context() && i < srh->first_segment)
-			print_string(PRINT_FP, NULL, "%s", ",");
+		if (sr_has_hmac(srh)) {
+			struct sr6_tlv_hmac *tlv;
+			unsigned int offset = ((srh->hdrlen + 1) << 3) -
+					      sizeof(*tlv);
 
-		print_color_string(PRINT_ANY, COLOR_INET6, NULL, "%s",
-				   rt_addr_n2a(AF_INET6, 16,
-					       &srh->segments[i]));
-	}
-
-	if (is_json_context())
-		close_json_array(PRINT_JSON, NULL);
-	else
-		print_string(PRINT_FP, NULL, "%s", " ");
-
-	if (sr_has_hmac(srh)) {
-		unsigned int offset = ((srh->hdrlen + 1) << 3) - 40;
-		struct sr6_tlv_hmac *tlv;
-
-		tlv = (struct sr6_tlv_hmac *)((char *)srh + offset);
-		print_0xhex(PRINT_ANY, "hmac",
-			    "hmac %llX ", ntohl(tlv->hmackeyid));
+			tlv = (struct sr6_tlv_hmac *)((char *)srh + offset);
+			print_0xhex(PRINT_ANY, "hmac",
+				    "hmac %llX ", ntohl(tlv->hmackeyid));
+		}
 	}
 
 	if (tb[IFLA_SR6_FIB_TABLE])
